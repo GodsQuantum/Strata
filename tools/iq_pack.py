@@ -527,10 +527,16 @@ def main() -> int:
     want = experts_source(model, text, offset)
     reuse = path.exists() and path.stat().st_size == offset and read_json(sidecar) == want
 
-    def layer_blobs(blob, ts):
-        chunk = np.concatenate([model.bytes(t.name).reshape(n_expert, -1) for t in ts], axis=1)
-        assert chunk.shape == (n_expert, blob)             # (n_expert, blob): gate | up | down per expert
-        return chunk
+    def layer_views(blob, ts):
+        """Zero-copy expert views for one layer.
+
+        Keep source tensors as memmap-backed views and stream one expert at a
+        time. This avoids retaining several GiB of temporary NumPy allocations
+        while building experts.bin on UMA / low-RAM hosts.
+        """
+        views = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
+        assert sum(v.shape[1] for v in views) == blob
+        return views
 
     if reuse:
         # the sidecar names the shards by name and size, which a re-quantized or fine-tuned checkpoint of the same
@@ -586,7 +592,10 @@ def main() -> int:
     part = out / "experts.bin.tmp"
     with open(part, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
-            fo.write(layer_blobs(blob, ts).tobytes())
+            views = layer_views(blob, ts)
+            for e in range(n_expert):
+                for view in views:
+                    fo.write(view[e].tobytes())
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)

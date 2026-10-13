@@ -3,7 +3,7 @@ name: Cloud9 Radeon port — CPU-only source checks
 on:
   push:
     branches:
-      - cloud9/gfx1103-v0.1.43.1
+      - main
   pull_request:
     branches:
       - main

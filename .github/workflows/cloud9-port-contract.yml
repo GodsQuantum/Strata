@@ -1,0 +1,37 @@
+name: Cloud9 Radeon port — CPU-only source checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-source-without-gpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Byte-identical streaming expert packer contracts
+        run: python3 -B tests/cloud9_iq_pack_streaming_test.py
+      - name: Source syntax and portable configuration assertions
+        run: |
+          python3 -B - <<'PY'
+          import ast
+          from pathlib import Path
+
+          ast.parse(Path("tools/iq_pack.py").read_text(encoding="utf-8"))
+          header = Path("include/strata/hip_compat/cuda_runtime.h").read_text()
+          cpp = Path("src/core/device.cu").read_text()
+          assert "cudaMemGetInfo" in header
+          assert "STRATA_DEVICE_BUDGET_MIB" in cpp
+          assert "effective_free" in cpp
+          assert "hipMemGetInfo" in cpp
+          assert Path("docs/cloud9-radeon-780m-gfx1103.md").is_file()
+          print("CLOUD9_GFX1103_STATIC_CONTRACTS_PASS")
+          PY

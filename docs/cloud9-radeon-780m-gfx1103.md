@@ -38,3 +38,12 @@ Once GPU is healthy, compare v0.1.43 and v0.1.43.1 on the **same** model weights
 - The branch preserved on `GodsQuantum/Strata` does **not** represent a published/benchmarked container image; do not update production runtime or reconfigure other LXCs by merging it.
 
 The fork retains upstream license and attribution; Cloud9-specific changes are isolated in the named branch for upstream rebase and review.
+
+
+## 13 October 2026 — byte layout validation without GPU
+
+The low-memory `tools/iq_pack.py` writer is now extracted into the testable production helper `write_expert_views` (no data-format change). CPU-only tests execute its **actual function AST**, verify expert-major gate/up/down ordering for 2 and 5 experts, and assert that the real file writer calls it; 3/3 tests pass without NumPy or GPU.
+
+A separate physical test on Cloud9 ran the same helper with **real NumPy memmap arrays** (12 experts, 32/64/48 bytes across gate/up/down), in a throwaway CT410 Docker container restricted to 1 CPU / 768 MiB / no GPU/network. The new streamed output was **byte-for-byte identical** to the original `np.concatenate(arrays, axis=1).tobytes()` layout: 1,728 bytes; SHA256 `09d75d841a7e8651cc4dc7f7d56e7bbf93a701af61c8c862b806fb1f983fca6f`. Test staging was removed and the four live APIs remained HTTP 200.
+
+This validates *format correctness on representative small arrays*, **not** model-wide decode correctness, peak-memory reduction on large models, or GPU throughput. The five older non-green HIP/ctest cases remain unverified. The fork includes a lightweight GitHub Actions source contract workflow; it does not compile or exercise the GPU.

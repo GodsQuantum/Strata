@@ -490,6 +490,18 @@ def read_json(path: pathlib.Path):
         return None
 
 
+def write_expert_views(output, views, n_expert: int) -> None:
+    """Stream packed tensors in expert-major order without layer concatenation.
+
+    The previous np.concatenate(..., axis=1).tobytes() layout is:
+    for every expert, gate bytes then up bytes then down bytes. Iterating the
+    views is byte-identical and avoids several gigabytes of peak RAM.
+    """
+    for e in range(n_expert):
+        for view in views:
+            output.write(view[e].tobytes())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
@@ -593,9 +605,7 @@ def main() -> int:
     with open(part, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
             views = layer_views(blob, ts)
-            for e in range(n_expert):
-                for view in views:
-                    fo.write(view[e].tobytes())
+            write_expert_views(fo, views, n_expert)
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)

@@ -26,6 +26,8 @@ jobs:
           python3 -m venv /tmp/cloud9-strata-numpy
           /tmp/cloud9-strata-numpy/bin/pip install --disable-pip-version-check --no-cache-dir numpy==2.3.1
           /tmp/cloud9-strata-numpy/bin/python -B tests/cloud9_iq_pack_numpy_smoke.py
+      - name: Read-only GPU admission guard contracts (no model, no GPU)
+        run: python3 -B tools/test_cloud9_strata_admission.py
       - name: Source syntax and portable configuration assertions
         run: |
           python3 -B - <<'PY'

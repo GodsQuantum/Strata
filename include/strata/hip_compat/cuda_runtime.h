@@ -92,7 +92,13 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 }
 #define cudaMemGetInfo ::strata::hip_compat::mem_get_info
 #else
-#define cudaMemGetInfo hipMemGetInfo
+// Linux UMA/APU: wrap hipMemGetInfo so Cloud9 can impose an explicit
+// STRATA_DEVICE_BUDGET_MIB planning ceiling instead of treating all
+// host-visible memory as dedicated GPU VRAM.
+namespace strata::hip_compat {
+hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
+}
+#define cudaMemGetInfo ::strata::hip_compat::mem_get_info
 #endif
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpy2DAsync hipMemcpy2DAsync

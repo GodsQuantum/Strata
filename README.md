@@ -2,6 +2,8 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> **GodsQuantum Cloud9 fork (experimental):** The Radeon 780M / gfx1103 HIP branch and its tested limits are documented in [Cloud9 Radeon 780M port](docs/cloud9-radeon-780m-gfx1103.md). This source branch is **not** a certified performance upgrade or replacement for the upstream releases. The original MIT license and authorship remain unchanged.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 

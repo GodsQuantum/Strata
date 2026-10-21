@@ -1822,7 +1822,7 @@ bool gdn_rec_wmma(float* state, const float* h, const float* gate, const float* 
     if (dev != last_device) {
         cudaDeviceProp p{};
         if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        gfx11 = strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+        gfx11 = strata::kernels::gfx_arch_has_safe_gdn_chunked_wmma(p.gcnArchName);
         last_device = dev;
     }
     if (!gfx11) return false;

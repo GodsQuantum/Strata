@@ -505,6 +505,20 @@ def read_json(path: pathlib.Path):
         return None
 
 
+def write_expert_views(output, views, n_expert: int, tail=None) -> None:
+    """Stream packed tensors in expert-major order without layer concatenation.
+
+    The previous np.concatenate(..., axis=1).tobytes() layout is:
+    for every expert, gate bytes then up bytes then down bytes. Iterating the
+    views is byte-identical and avoids several gigabytes of peak RAM.
+    """
+    for e in range(n_expert):
+        for view in views:
+            output.write(view[e].tobytes())
+        if tail is not None:
+            output.write(tail[e].tobytes())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
@@ -556,17 +570,21 @@ def main() -> int:
             return None
         return tail.view(np.uint8)
 
-    def layer_blobs(l, blob, ts):
-        """(n_expert, blob): gate | up | down [| the NVFP4 scale tail] per expert; None for a bad NVFP4 scale."""
-        parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
-        if any(t.type_name == "NVFP4" for t in ts):
-            tail = nvfp4_tails(l, ts)
-            if tail is None:
-                return None
-            parts.append(tail)
-        chunk = np.concatenate(parts, axis=1)
-        assert chunk.shape == (n_expert, blob)
-        return chunk
+    def layer_views(l, blob, ts):
+        """Return memmap-backed expert views and optional small NVFP4 scale tail.
+
+        Never materialize np.concatenate of a whole expert layer: on UMA
+        systems this can waste multiple GiB of temporary RAM. The output is
+        expert-major gate | up | down | optional NVFP4 16-byte scale tail,
+        byte-identical to upstream's layer_blobs.
+        """
+        views = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
+        tail = nvfp4_tails(l, ts) if any(t.type_name == "NVFP4" for t in ts) else None
+        if any(t.type_name == "NVFP4" for t in ts) and tail is None:
+            return None
+        assert sum(v.shape[1] for v in views) + (NVFP4_TAIL if tail is not None else 0) == blob
+        return views, tail
+
 
     if reuse:
         # the sidecar names the shards by name and size, which a re-quantized or fine-tuned checkpoint of the same
@@ -625,10 +643,11 @@ def main() -> int:
     part = out / "experts.bin.tmp"
     with open(part, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
-            chunk = layer_blobs(l, blob, ts)
-            if chunk is None:
+            pair = layer_views(l, blob, ts)
+            if pair is None:
                 return 1
-            fo.write(chunk.tobytes())
+            views, tail = pair
+            write_expert_views(fo, views, n_expert, tail)
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)

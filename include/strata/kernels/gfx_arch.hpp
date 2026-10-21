@@ -25,6 +25,15 @@ inline bool gfx_arch_is_gfx11_wmma(const char* gcn) {
            gfx_arch_is(gcn, "gfx1150") || gfx_arch_is(gcn, "gfx1151");
 }
 
+/// Gate the optional chunked GDN WMMA recurrence independently from other RDNA3
+/// matrix kernels. gfx1103 (Radeon 780M) faulted in gdn_wmma_prep_kernel with
+/// HSA_STATUS_ERROR_EXCEPTION and caused an AMDGPU MODE2 reset on 2026-10-17.
+/// Fail closed for this device; ordinary serial GDN kernels remain available.
+/// Do not remove this quarantine without gfx1103-specific parity and stability.
+inline bool gfx_arch_has_safe_gdn_chunked_wmma(const char* gcn) {
+    return gfx_arch_is_gfx11_wmma(gcn) && !gfx_arch_is(gcn, "gfx1103");
+}
+
 /// The gfx12 (RDNA4) targets the gfx12 matrix-core kernels are compiled for (`#if defined(__gfx1200__) ||
 /// defined(__gfx1201__)`): the R9700 / 9070 (XT) are gfx1201, the 9060 (XT) gfx1200.
 inline bool gfx_arch_is_gfx12_wmma(const char* gcn) { return gfx_arch_is(gcn, "gfx1200") || gfx_arch_is(gcn, "gfx1201"); }

@@ -219,6 +219,50 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes) {
 }  // namespace strata::hip_compat
 #endif
 
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+#include <atomic>
+#include <cstdlib>
+
+namespace strata::hip_compat {
+
+hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes) {
+    const hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
+    if (e != hipSuccess || free_bytes == nullptr || total_bytes == nullptr) return e;
+
+    static const size_t cap_bytes = [] {
+        const char* v = std::getenv("STRATA_DEVICE_BUDGET_MIB");
+        if (v == nullptr || *v == '\0') return (size_t) 0;
+        char* end = nullptr;
+        const unsigned long long mib = std::strtoull(v, &end, 10);
+        if (end == v || *end != '\0' || mib == 0) return (size_t) 0;
+        const unsigned long long max_mib = (unsigned long long) (~(size_t) 0) >> 20;
+        const unsigned long long safe_mib = mib > max_mib ? max_mib : mib;
+        return (size_t) safe_mib << 20;
+    }();
+
+    if (cap_bytes == 0) return e;
+
+    const size_t raw_total = *total_bytes;
+    const size_t raw_free = *free_bytes;
+    const size_t raw_used = raw_total > raw_free ? raw_total - raw_free : 0;
+    const size_t effective_total = raw_total < cap_bytes ? raw_total : cap_bytes;
+    const size_t effective_free = effective_total > raw_used ? effective_total - raw_used : 0;
+    *total_bytes = effective_total;
+    *free_bytes = raw_free < effective_free ? raw_free : effective_free;
+
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) {
+        std::fprintf(stderr,
+                     "strata: Linux HIP device-memory budget capped at %llu MiB "
+                     "(STRATA_DEVICE_BUDGET_MIB; raw HIP total %.1f GiB)\n",
+                     (unsigned long long) (effective_total >> 20),
+                     (double) raw_total / 1073741824.0);
+    }
+    return e;
+}
+}  // namespace strata::hip_compat
+#endif
+
 namespace strata::core {
 
 std::string gpu_arch_problem(int ordinal) {

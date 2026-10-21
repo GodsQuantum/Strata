@@ -59,6 +59,11 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 namespace K = strata::kernels;
@@ -1026,8 +1031,12 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     m.layers.resize((size_t) g.n_layers);
     // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
-    (void) want_mtp;
-    m.has_mtp = g.n_mtp_layers > 0;
+    // gfx1103 opt-in: MTP is a complete expert layer; do not allocate it for
+    // a benchmark with --mtp 0. Keep default behavior unless explicitly opted in.
+    const bool no_unused_mtp = std::getenv("STRATA_Q36_SKIP_UNUSED_MTP") != nullptr;
+    m.has_mtp = g.n_mtp_layers > 0 && (!no_unused_mtp || want_mtp);
+    if (no_unused_mtp && !want_mtp && g.n_mtp_layers > 0)
+        std::fprintf(stderr, "strata-q36: skipped unused MTP expert layer (MTP disabled)\n");
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
         Layer& y = is_mtp ? m.mtp : m.layers[(size_t) l];
@@ -2803,9 +2812,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         per_slot += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
+    // gfx1103 lab opt-in: reduce per-prompt temporary attention score buffers
+    // when context and chunk are small; saves up to ~378 MiB vs 64M score cells.
+    // E.process() already slices prompt attention according to kAttScoreFloats.
+    if (std::getenv("STRATA_Q36_COMPACT_ATT")) {
+        E.shrink_att((size_t) 1 << 20);
+        std::fprintf(stderr, "strata-q36: compact 780M attention scores: 1M cells (lab opt-in)\n");
+    }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
+    // gfx1103 full-GPU opt-in: upstream already permits 256 MiB safety
+    // margin for almost-fitting experts; CT410's global guard remains intact.
+    const size_t reserve = (size_t) (std::getenv("STRATA_Q36_GPU_ONLY") ? 192 : 768) << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
@@ -2834,6 +2852,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                      (double) packed_bytes / (1 << 30));
     }
     size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
+    if (std::getenv("STRATA_Q36_MEM_DEBUG")) {
+        std::fprintf(stderr,
+            "strata-q36: allGPU preflight experts=%.3f GiB / main=%.3f GiB / GPU free=%.3f GiB / plan=%.3f GiB / slots=%d\n",
+            (double)total / (1ull << 30), (double)main_need / (1ull << 30),
+            (double)fr / (1ull << 30), (double)budget2 / (1ull << 30), slots);
+    }
+
     // the MAIN layers' experts fit, the MTP block's not all (UD-Q6_K_XL on 32 GB): the main layers all in VRAM - the
     // text is the all-in-VRAM text, the decode graph stays - and the MTP block's experts on slots + the CPU pool (its
     // drafts only).  When that needs it: the attention scores buffer at 64 MB instead of 256 MB (more, smaller
@@ -2859,21 +2884,71 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                          "budget instead\n");
         }
     }
-    if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
+    if (slots <= 0 && total <= budget2 && total + ((size_t) (std::getenv("STRATA_Q36_GPU_ONLY") ? 192 : 256) << 20) <= fr) {
         std::vector<uint8_t> blob;
+        const bool bulk_upload = std::getenv("STRATA_Q36_BULK_UPLOAD") != nullptr;
         for (Layer* L : all) {
-            CK(cudaMalloc(&L->blobs, L->stride * (size_t) ne + kMmqTail));
-            CK(cudaMemset(L->blobs, 0, L->stride * (size_t) ne + kMmqTail));
-            blob.assign(L->L.bytes, 0);
-            for (int64_t e = 0; e < ne; ++e) {
-                expert_blob(*L, e, blob.data());
-                CK(cudaMemcpy(L->blobs + (size_t) e * L->stride, blob.data(), L->L.bytes, cudaMemcpyHostToDevice));
+            const size_t layer_bytes = L->stride * (size_t) ne + kMmqTail;
+            if (bulk_upload) {
+                // On AMD UMA gfx1103, prepare one *contiguous* layer on CPU then upload
+                // once. All stride padding and the MMQ tail remain zero initialized.
+                // Avoid 256 individual synchronous copies and full-device cudaMemset
+                // per layer: both may stall the global Proxmox allocator.
+                std::vector<uint8_t> layer_host(layer_bytes, 0);
+                for (int64_t e = 0; e < ne; ++e)
+                    expert_blob(*L, e, layer_host.data() + (size_t)e * L->stride);
+                CK(cudaMalloc(&L->blobs, layer_bytes));
+                CK(cudaMemcpy(L->blobs, layer_host.data(), layer_bytes, cudaMemcpyHostToDevice));
+#if defined(__linux__)
+                // After the layer's experts are resident on GPU, these three
+                // GGUF mmap spans are no longer needed for this layer. Drop
+                // clean file-backed pages so an UMA host does not keep both
+                // the 10 GiB source and the 10 GiB GPU destination resident.
+                if (std::getenv("STRATA_Q36_DROP_SOURCE_PAGES")) {
+                    const long psz = ::sysconf(_SC_PAGESIZE);
+                    if (psz > 0 && ((psz & (psz - 1)) == 0)) {
+                        const auto release = [psz](const uint8_t* ptr, size_t n) {
+                            const uintptr_t mask = (uintptr_t)psz - 1;
+                            const uintptr_t begin = (uintptr_t)ptr & ~mask;
+                            const uintptr_t end = ((uintptr_t)ptr + n) & ~mask;
+                            if (end > begin) (void)::madvise((void*)begin, end - begin, MADV_DONTNEED);
+                        };
+                        release(L->src_g, (size_t)ne * L->src_gsz);
+                        release(L->src_u, (size_t)ne * L->src_gsz);
+                        release(L->src_d, (size_t)ne * L->src_dsz);
+                    }
+                }
+#endif
+                if (std::getenv("STRATA_Q36_MEM_DEBUG"))
+                    std::fprintf(stderr, "strata-q36: bulk GPU upload layer %.1f MiB in %.1f s\n",
+                        (double)layer_bytes / (1 << 20), ms_since(t0)/1000.0);
+            } else {
+                CK(cudaMalloc(&L->blobs, layer_bytes));
+                CK(cudaMemset(L->blobs, 0, layer_bytes));
+                blob.assign(L->L.bytes, 0);
+                for (int64_t e = 0; e < ne; ++e) {
+                    expert_blob(*L, e, blob.data());
+                    CK(cudaMemcpy(L->blobs + (size_t) e * L->stride, blob.data(), L->L.bytes, cudaMemcpyHostToDevice));
+                }
             }
             L->n_slots = (int) ne;
         }
         std::fprintf(stderr, "strata-q36: every routed expert in VRAM (%.2f GiB) in %.1f s\n", (double) total / (1 << 30),
                      ms_since(t0) / 1000.0);
         return true;
+    }
+    // Lab opt-in: require fully GPU-resident routed experts; never allocate a
+    // duplicate 9.93 GiB host/SSD expert pool if the full model does not fit.
+    // Qwen3.6 MTP draft is a separate expert layer. If the main 40 layers
+    // fit fully on GPU, allow ONLY the optional MTP layer in the CPU pool.
+    // Do not allow a hybrid fallback for any of the main layers.
+    if (std::getenv("STRATA_Q36_GPU_ONLY") &&
+        !(mtp_only && std::getenv("STRATA_Q36_ALLOW_MTP_CPU_ONLY"))) {
+        err = "all-GPU expert placement needs " + std::to_string(total >> 20)
+            + " MiB experts; free=" + std::to_string(fr >> 20)
+            + " MiB, planned=" + std::to_string(budget2 >> 20)
+            + " MiB (host/SSD expert duplication forbidden)";
+        return false;
     }
 #if !defined(STRATA_Q36_CPU_POOL)
     (void) threads;
@@ -2933,12 +3008,37 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
-            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ne + kMmqTail));
-            std::vector<uint8_t> blob(L.L.bytes, 0);
-            for (int64_t e = 0; e < ne; ++e) {
-                expert_blob(L, e, blob.data());
-                CK(cudaMemcpy(L.blobs + (size_t) e * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+            if (std::getenv("STRATA_Q36_BULK_UPLOAD")) {
+                const size_t layer_bytes = L.stride * (size_t) ne + kMmqTail;
+                std::vector<uint8_t> layer_host(layer_bytes, 0);
+                for (int64_t e = 0; e < ne; ++e)
+                    expert_blob(L, e, layer_host.data() + (size_t)e * L.stride);
+                CK(cudaMalloc(&L.blobs, layer_bytes));
+                CK(cudaMemcpy(L.blobs, layer_host.data(), layer_bytes, cudaMemcpyHostToDevice));
+#if defined(__linux__)
+                if (std::getenv("STRATA_Q36_DROP_SOURCE_PAGES")) {
+                    const long psz = ::sysconf(_SC_PAGESIZE);
+                    if (psz > 0 && ((psz & (psz - 1)) == 0)) {
+                        const auto release = [psz](const uint8_t* ptr, size_t n) {
+                            const uintptr_t mask = (uintptr_t)psz - 1;
+                            const uintptr_t begin = (uintptr_t)ptr & ~mask;
+                            const uintptr_t end = ((uintptr_t)ptr + n) & ~mask;
+                            if (end > begin) (void)::madvise((void*)begin, end - begin, MADV_DONTNEED);
+                        };
+                        release(L.src_g, (size_t)ne * L.src_gsz);
+                        release(L.src_u, (size_t)ne * L.src_gsz);
+                        release(L.src_d, (size_t)ne * L.src_dsz);
+                    }
+                }
+#endif
+            } else {
+                CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
+                CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ne + kMmqTail));
+                std::vector<uint8_t> blob(L.L.bytes, 0);
+                for (int64_t e = 0; e < ne; ++e) {
+                    expert_blob(L, e, blob.data());
+                    CK(cudaMemcpy(L.blobs + (size_t) e * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
             }
             L.n_slots = (int) ne;
             continue;
